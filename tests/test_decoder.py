@@ -93,6 +93,23 @@ def ihdr(width: int, height: int, color_type: int = 2, interlace: int = 0,
     )
 
 
+def trns(color: tuple[int, int, int]) -> bytes:
+    return chunk(b"tRNS", struct.pack(">HHH", *color))
+
+
+def expected_rgb_with_transparency(
+    width: int, height: int, transparent_color: tuple[int, int, int]
+) -> bytes:
+    result = bytearray()
+    for y in range(height):
+        for x in range(width):
+            r = (x * 37 + y * 19) & 0xFF
+            g = (x * 11 + y * 53 + 7) & 0xFF
+            b = (x * 71 + y * 5 + 31) & 0xFF
+            result.extend((r, g, b, 0 if (r, g, b) == transparent_color else 255))
+    return bytes(result)
+
+
 def pass_dimensions(width: int, height: int):
     for start_x, start_y, step_x, step_y in ADAM7:
         pass_width = max(0, (width - start_x + step_x - 1) // step_x)
@@ -249,6 +266,73 @@ class PNGDecoderTests(unittest.TestCase):
         self.assertEqual([len(row) for row in image.passes[0].rows], [15] * 5)
         self.assertEqual(image.pixels, to_rgba(expected_pixels(5, 5, 3), 3))
         self.assert_matches_trusted_decoder(data, 5, 5)
+
+    def test_rgb_transparency_in_noninterlaced_image(self):
+        width, height = 5, 5
+        transparent_color = (0, 7, 31)  # Pixel (0, 0) in expected_pixels.
+        data = make_png(width, height, color_type=2, idat_parts=2)
+        data = insert_after_ihdr(data, trns(transparent_color))
+
+        image = decode_png(data)
+        self.assertEqual(
+            image.pixels,
+            expected_rgb_with_transparency(width, height, transparent_color),
+        )
+        self.assertEqual(image.pixels[3], 0)
+        self.assertEqual(image.pixels[7], 255)
+        self.assert_matches_trusted_decoder(data, width, height)
+
+    def test_rgb_transparency_in_adam7_image(self):
+        width, height = 11, 9
+        transparent_color = (19, 60, 36)  # Pixel (0, 1) in expected_pixels.
+        data = make_png(width, height, color_type=2, interlace=1, idat_parts=3)
+        data = insert_after_ihdr(data, trns(transparent_color))
+
+        image = decode_png(data)
+        self.assertEqual(
+            image.pixels,
+            expected_rgb_with_transparency(width, height, transparent_color),
+        )
+        self.assertEqual(
+            image.pixels[(1 * width) * 4 + 3],
+            0,
+        )
+        self.assert_matches_trusted_decoder(data, width, height)
+
+    def test_duplicate_trns_chunk_rejected(self):
+        data = insert_after_ihdr(make_png(2, 2), trns((0, 7, 31)))
+        data = insert_after_ihdr(data, trns((1, 2, 3)))
+        with self.assertRaisesRegex(PNGDecodeError, "duplicate tRNS"):
+            decode_png(data)
+
+    def test_trns_after_idat_rejected(self):
+        data = insert_after_idat(make_png(2, 2), trns((0, 7, 31)))
+        with self.assertRaisesRegex(PNGDecodeError, "tRNS appears after IDAT"):
+            decode_png(data)
+
+    def test_trns_with_rgba_image_rejected(self):
+        data = insert_after_ihdr(
+            make_png(2, 2, color_type=6), trns((0, 7, 31))
+        )
+        with self.assertRaisesRegex(PNGDecodeError, "tRNS is forbidden in RGBA"):
+            decode_png(data)
+
+    def test_invalid_trns_payload_rejected(self):
+        cases = (
+            b"",
+            b"\x00\x01",
+            b"\x01\x00\x00\x01\x00\x02",
+            b"\x00\x00\x00\x01\x00\x02\x00\x03",
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                data = insert_after_ihdr(
+                    make_png(1, 1), chunk(b"tRNS", payload)
+                )
+                with self.assertRaisesRegex(
+                    PNGDecodeError, "invalid tRNS|8-bit tRNS"
+                ):
+                    decode_png(data)
 
     def test_noninterlaced_rgba_size_and_filters(self):
         data = make_png(7, 6, color_type=6, interlace=0, idat_parts=4)

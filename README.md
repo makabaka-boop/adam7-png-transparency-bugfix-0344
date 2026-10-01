@@ -4,6 +4,7 @@
 supported subset:
 
 - 8-bit RGB (`color type 2`) and RGBA (`color type 6`)
+- RGB transparency declared with one valid pre-IDAT `tRNS` chunk
 - non-interlaced and Adam7-interlaced images
 - all five PNG scanline filters
 - at most 4,000,000 pixels

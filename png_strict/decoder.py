@@ -73,6 +73,7 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
     pos = len(PNG_SIGNATURE)
     ihdr = None
     saw_plte = False
+    transparent_color: tuple[int, int, int] | None = None
     compressed_parts: list[bytes] = []
     saw_iend = False
     state = "before_idat"
@@ -114,10 +115,14 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
                 raise PNGDecodeError("PLTE appears after IDAT")
             if saw_plte:
                 raise PNGDecodeError("duplicate PLTE chunk")
+            if transparent_color is not None:
+                raise PNGDecodeError("PLTE appears after tRNS")
             if ihdr[2] == 4:
                 raise PNGDecodeError("PLTE is forbidden in RGBA PNGs")
             _validate_plte(payload)
             saw_plte = True
+        elif chunk_type == b"tRNS":
+            transparent_color = _parse_trns(payload, ihdr, state, transparent_color)
         elif chunk_type == b"IDAT":
             if ihdr is None:
                 raise PNGDecodeError("IDAT appears before IHDR")
@@ -188,6 +193,7 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
                 pixels,
                 width,
                 channels,
+                transparent_color,
                 pass_width,
                 start_x,
                 start_y + (len(rows) - 1) * y_step,
@@ -282,6 +288,31 @@ def _validate_unknown_or_ancillary(
 def _validate_plte(payload: bytes) -> None:
     if len(payload) == 0 or len(payload) % 3 != 0 or len(payload) // 3 > 256:
         raise PNGDecodeError("invalid PLTE chunk")
+
+
+def _parse_trns(
+    payload: bytes,
+    ihdr: tuple[int, int, int, int] | None,
+    state: str,
+    transparent_color: tuple[int, int, int] | None,
+) -> tuple[int, int, int] | None:
+    if ihdr is None:
+        raise PNGDecodeError("tRNS appears before IHDR")
+    if transparent_color is not None:
+        raise PNGDecodeError("duplicate tRNS chunk")
+    if state != "before_idat":
+        raise PNGDecodeError("tRNS appears after IDAT")
+    if ihdr[2] == 4:
+        raise PNGDecodeError("tRNS is forbidden in RGBA PNGs")
+    if len(payload) != 6:
+        raise PNGDecodeError("invalid tRNS length for an RGB PNG")
+
+    values = struct.unpack(">HHH", payload)
+    # With bit depth 8, the 16-bit PNG sample must contain the value in its
+    # low byte and zeros in its high byte.
+    if any(value > 255 for value in values):
+        raise PNGDecodeError("invalid 8-bit tRNS sample")
+    return values
 
 
 def _bounded_inflate(parts: list[bytes], expected_bytes: int) -> bytes:
@@ -417,6 +448,7 @@ def _place_pass_row(
     output: bytearray,
     image_width: int,
     channels: int,
+    transparent_color: tuple[int, int, int] | None,
     pass_width: int,
     start_x: int,
     destination_y: int,
@@ -428,7 +460,11 @@ def _place_pass_row(
         target = (destination_y * image_width + destination_x) * 4
         if channels == 3:
             output[target : target + 3] = row[source_x : source_x + 3]
-            output[target + 3] = 255
+            output[target + 3] = (
+                0
+                if tuple(row[source_x : source_x + 3]) == transparent_color
+                else 255
+            )
         else:
             output[target : target + 4] = row[source_x : source_x + 4]
 
