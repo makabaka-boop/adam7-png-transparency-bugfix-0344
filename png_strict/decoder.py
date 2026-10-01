@@ -73,6 +73,7 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
     pos = len(PNG_SIGNATURE)
     ihdr = None
     saw_plte = False
+    trns_key: tuple[int, int, int] | None = None
     compressed_parts: list[bytes] = []
     saw_iend = False
     state = "before_idat"
@@ -118,6 +119,16 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
                 raise PNGDecodeError("PLTE is forbidden in RGBA PNGs")
             _validate_plte(payload)
             saw_plte = True
+        elif chunk_type == b"tRNS":
+            if ihdr is None:
+                raise PNGDecodeError("tRNS appears before IHDR")
+            if state != "before_idat":
+                raise PNGDecodeError("tRNS appears after IDAT")
+            if trns_key is not None:
+                raise PNGDecodeError("duplicate tRNS chunk")
+            if ihdr[2] == 4:
+                raise PNGDecodeError("tRNS is forbidden in RGBA PNGs")
+            trns_key = _validate_rgb_trns(payload)
         elif chunk_type == b"IDAT":
             if ihdr is None:
                 raise PNGDecodeError("IDAT appears before IHDR")
@@ -192,6 +203,7 @@ def decode_png(source: bytes | bytearray | "memoryview") -> PNGImage:
                 start_x,
                 start_y + (len(rows) - 1) * y_step,
                 _ADAM7_PASSES[pass_index][2] if interlace == 1 else 1,
+                trns_key,
             )
 
         passes.append(
@@ -277,6 +289,18 @@ def _validate_unknown_or_ancillary(
     is_ancillary = bool(chunk_type[0] & ancillary_bit)
     if not is_ancillary:
         raise PNGDecodeError(f"unknown critical chunk {text} is not supported")
+
+
+def _validate_rgb_trns(payload: bytes) -> tuple[int, int, int]:
+    # For 8-bit RGB (color type 2) the tRNS data is exactly three 16-bit
+    # samples; the declared value must be an 8-bit sample, so the high bytes
+    # have to be zero.
+    if len(payload) != 6:
+        raise PNGDecodeError("invalid tRNS chunk length")
+    r16, g16, b16 = struct.unpack(">HHH", payload)
+    if (r16 & 0xFF00) or (g16 & 0xFF00) or (b16 & 0xFF00):
+        raise PNGDecodeError("tRNS value does not fit in 8-bit samples")
+    return r16 & 0xFF, g16 & 0xFF, b16 & 0xFF
 
 
 def _validate_plte(payload: bytes) -> None:
@@ -421,14 +445,16 @@ def _place_pass_row(
     start_x: int,
     destination_y: int,
     x_step: int,
+    trns_key: tuple[int, int, int] | None,
 ) -> None:
     for column in range(pass_width):
         source_x = column * channels
         destination_x = start_x + column * x_step
         target = (destination_y * image_width + destination_x) * 4
         if channels == 3:
-            output[target : target + 3] = row[source_x : source_x + 3]
-            output[target + 3] = 255
+            red, green, blue = row[source_x : source_x + 3]
+            output[target : target + 3] = red, green, blue
+            output[target + 3] = 0 if (red, green, blue) == trns_key else 255
         else:
             output[target : target + 4] = row[source_x : source_x + 4]
 

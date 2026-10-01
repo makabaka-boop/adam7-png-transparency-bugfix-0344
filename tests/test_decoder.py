@@ -35,14 +35,22 @@ def expected_pixels(width: int, height: int, channels: int) -> bytes:
     return bytes(result)
 
 
-def to_rgba(raw: bytes, channels: int) -> bytes:
+def to_rgba(raw: bytes, channels: int, trns_key: tuple[int, int, int] | None = None) -> bytes:
     if channels == 4:
         return raw
     result = bytearray()
     for offset in range(0, len(raw), 3):
-        result.extend(raw[offset : offset + 3])
-        result.append(255)
+        red, green, blue = raw[offset : offset + 3]
+        result.extend((red, green, blue))
+        if trns_key is not None and (red, green, blue) == trns_key:
+            result.append(0)
+        else:
+            result.append(255)
     return bytes(result)
+
+
+def trns_chunk(red: int, green: int, blue: int) -> bytes:
+    return chunk(b"tRNS", struct.pack(">HHH", red, green, blue))
 
 
 def paeth(left: int, up: int, upper_left: int) -> int:
@@ -109,6 +117,7 @@ def make_png(
     color_type: int = 2,
     interlace: int = 0,
     idat_parts: int = 1,
+    trns_key: tuple[int, int, int] | None = None,
     filter_pattern=lambda row_number: row_number % 5,
 ) -> bytes:
     channels = {2: 3, 6: 4}[color_type]
@@ -146,8 +155,18 @@ def make_png(
         chunk(b"IDAT", compressed[boundaries[i] : boundaries[i + 1]])
         for i in range(idat_parts)
     )
-    return PNG_SIGNATURE + ihdr(width, height, color_type, interlace) + idat + chunk(
-        b"IEND", b""
+    if trns_key is not None:
+        if color_type != 2:
+            raise ValueError("tRNS key is only valid for RGB fixtures")
+        trns = trns_chunk(*trns_key)
+    else:
+        trns = b""
+    return (
+        PNG_SIGNATURE
+        + ihdr(width, height, color_type, interlace)
+        + trns
+        + idat
+        + chunk(b"IEND", b"")
     )
 
 
@@ -315,6 +334,109 @@ class PNGDecoderTests(unittest.TestCase):
                             to_rgba(expected, channels),
                         )
                         self.assert_matches_trusted_decoder(data, width, height)
+
+    def test_trns_transparent_color_noninterlaced(self):
+        # Pixel (0, 0) of the fixture has exactly this colour.
+        key = (0, 7, 31)
+        data = make_png(5, 5, color_type=2, interlace=0, idat_parts=3, trns_key=key)
+        image = decode_png(data)
+        expected = to_rgba(expected_pixels(5, 5, 3), 3, key)
+        self.assertEqual(image.pixels, expected)
+        self.assertEqual(image.pixels[3], 0)
+        self.assertEqual(image.pixels[7], 255)
+        # Reconstructed pass rows stay RGB; transparency only affects output.
+        self.assertEqual([len(row) for row in image.passes[0].rows], [15] * 5)
+        self.assert_matches_trusted_decoder(data, 5, 5)
+
+    def test_trns_transparent_color_adam7(self):
+        key = (0, 7, 31)
+        data = make_png(
+            11, 9, color_type=2, interlace=1, idat_parts=3, trns_key=key
+        )
+        image = decode_png(data)
+        self.assertEqual(image.interlace_method, 1)
+        expected = to_rgba(expected_pixels(11, 9, 3), 3, key)
+        self.assertEqual(image.pixels, expected)
+        # The key pixel (0, 0) belongs to pass 0 and must be transparent.
+        self.assertEqual(image.pixels[3], 0)
+        self.assert_matches_trusted_decoder(data, 11, 9)
+
+    def test_trns_transparent_color_adam7_multiple_passes(self):
+        # Hand-built 2x2 Adam7 image: (0,0) is delivered by pass 0 while
+        # (0,1) and (1,1) are delivered by pass 6, so the transparent key
+        # has to be honoured in more than one interlace pass.
+        key = (10, 20, 30)
+        rows = {
+            (0, 0): key,
+            (1, 0): (40, 50, 60),
+            (0, 1): key,
+            (1, 1): (70, 80, 90),
+        }
+        raw = bytearray()
+        for pass_index, (pass_width, pass_height, start_x, start_y, _step_x, step_y) in enumerate(pass_dimensions(2, 2)):
+            for row_in_pass in range(pass_height):
+                y = start_y + row_in_pass * step_y
+                line = bytearray()
+                for column in range(pass_width):
+                    x = start_x + column * ADAM7[pass_index][2]
+                    line.extend(rows[(x, y)])
+                raw.append(0)
+                raw.extend(line)
+        data = (
+            PNG_SIGNATURE
+            + ihdr(2, 2, color_type=2, interlace=1)
+            + trns_chunk(*key)
+            + chunk(b"IDAT", zlib.compress(bytes(raw)))
+            + chunk(b"IEND", b"")
+        )
+        image = decode_png(data)
+        expected = bytearray()
+        for y in range(2):
+            for x in range(2):
+                expected.extend(rows[(x, y)])
+                expected.append(0 if rows[(x, y)] == key else 255)
+        self.assertEqual(image.pixels, bytes(expected))
+        self.assert_matches_trusted_decoder(data, 2, 2)
+
+    def test_trns_key_without_matching_pixels_leaves_alpha_opaque(self):
+        key = (123, 200, 77)
+        data = make_png(4, 4, color_type=2, trns_key=key)
+        image = decode_png(data)
+        self.assertEqual(image.pixels, to_rgba(expected_pixels(4, 4, 3), 3, key))
+        self.assertEqual(image.pixels[3::4], b"\xff" * 16)
+        self.assert_matches_trusted_decoder(data, 4, 4)
+
+    def test_duplicate_trns_chunk_rejected(self):
+        data = make_png(3, 3, trns_key=(0, 7, 31))
+        data = insert_after_ihdr(data, trns_chunk(0, 7, 31))
+        with self.assertRaisesRegex(PNGDecodeError, "duplicate tRNS"):
+            decode_png(data)
+
+    def test_trns_after_idat_rejected(self):
+        data = make_png(3, 3, idat_parts=1)
+        data = insert_after_idat(data, trns_chunk(0, 0, 0))
+        with self.assertRaisesRegex(PNGDecodeError, "tRNS appears after IDAT"):
+            decode_png(data)
+
+    def test_trns_in_rgba_png_rejected(self):
+        data = make_png(3, 3, color_type=6)
+        data = insert_after_ihdr(data, trns_chunk(0, 0, 0))
+        with self.assertRaisesRegex(PNGDecodeError, "tRNS is forbidden in RGBA"):
+            decode_png(data)
+
+    def test_trns_with_bad_length_rejected(self):
+        data = make_png(3, 3)
+        data = insert_after_ihdr(data, chunk(b"tRNS", b"\x00\x00\x00"))
+        with self.assertRaisesRegex(PNGDecodeError, "invalid tRNS chunk length"):
+            decode_png(data)
+
+    def test_trns_value_outside_8bit_samples_rejected(self):
+        data = make_png(3, 3)
+        # Big-endian 0x0100 sets the high byte, which cannot match an
+        # 8-bit sample and is invalid for an 8-bit image.
+        data = insert_after_ihdr(data, chunk(b"tRNS", b"\x01\x00\x00\x00\x00\x00"))
+        with self.assertRaisesRegex(PNGDecodeError, "8-bit samples"):
+            decode_png(data)
 
     def test_decompression_bomb_rejected_without_unbounded_output(self):
         # The dimensions describe only four pixels, while the stream expands to

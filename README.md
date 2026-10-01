@@ -6,6 +6,7 @@ supported subset:
 - 8-bit RGB (`color type 2`) and RGBA (`color type 6`)
 - non-interlaced and Adam7-interlaced images
 - all five PNG scanline filters
+- the `tRNS` transparent color for RGB images
 - at most 4,000,000 pixels
 
 The decoder returns RGBA bytes plus per-pass evidence. Empty Adam7 passes are
@@ -23,8 +24,12 @@ image.passes[0].rows  # reconstructed rows in one interlace pass
 
 Invalid signatures, CRCs, chunk ordering, non-contiguous IDAT data, truncated
 zlib/scanline streams, trailing image data, palette mode and unknown critical
-chunks are rejected. The pixel and decompression limits are enforced before
-inflation; zlib output is bounded to the exact expected scanline byte count.
+chunks are rejected.  `tRNS` is accepted for RGB images only, must precede the
+IDAT data, must appear at most once, and its declared samples must fit in eight
+bits; malformed or misplaced transparency declarations (including `tRNS` in an
+RGBA image) are rejected. The pixel and decompression limits are enforced
+before inflation; zlib output is bounded to the exact expected scanline byte
+count.
 
 Run the tests with:
 
